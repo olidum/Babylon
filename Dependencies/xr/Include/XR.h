@@ -296,6 +296,40 @@ namespace xr
                 private:
                     static inline Identifier NEXT_ID{ 0 };
                 };
+                
+                struct ImageTrackingBitmap
+                {
+                    uint8_t* data;
+                    uint32_t width;
+                    uint32_t height;
+                    uint32_t depth;
+                };
+
+                struct ImageTrackingResult
+                {
+                    using Identifier = size_t;
+                    const Identifier ID{ NEXT_ID++ };
+                    Space ImageSpace;
+                    uint32_t Index;
+                    std::string TrackingState;
+                    uint32_t MeasuredWidthInMeters;
+                    SceneObject::Identifier ParentSceneObjectID{ SceneObject::INVALID_ID };
+
+                private:
+                    static inline Identifier NEXT_ID{ 0 };
+                };
+                
+                struct ImageTrackingScore
+                {
+                    static constexpr auto UNTRACKABLE{"untrackable"};
+                    static constexpr auto TRACKABLE{"trackable"};
+                };
+                
+                struct ImageTrackingState
+                {
+                    static constexpr auto TRACKED{"tracked"};
+                    static constexpr auto EMULATED{"emulated"};
+                };
 
                 std::vector<View>& Views;
                 std::vector<InputSource>& InputSources;
@@ -309,6 +343,8 @@ namespace xr
                 std::vector<Plane::Identifier>RemovedPlanes;
                 std::vector<Mesh::Identifier>UpdatedMeshes;
                 std::vector<Mesh::Identifier>RemovedMeshes;
+                std::vector<ImageTrackingResult::Identifier>UpdatedImageTrackingResults;
+                std::vector<ImageTrackingResult::Identifier>RemovedImageTrackingResults;
 
                 bool IsTracking;
 
@@ -316,6 +352,7 @@ namespace xr
                 ~Frame();
 
                 void GetHitTestResults(std::vector<HitResult>&, Ray, HitTestTrackableType) const;
+                std::vector<char*> CreateAugmentedImageDatabase(std::vector<ImageTrackingBitmap>) const;
                 Anchor CreateAnchor(Pose, NativeAnchorPtr) const;
                 Anchor DeclareAnchor(NativeAnchorPtr) const;
                 void UpdateAnchor(Anchor&) const;
@@ -323,6 +360,7 @@ namespace xr
                 SceneObject& GetSceneObjectByID(SceneObject::Identifier) const;
                 Plane& GetPlaneByID(Plane::Identifier) const;
                 Mesh& GetMeshByID(Mesh::Identifier) const;
+                ImageTrackingResult& GetImageTrackingResultByID(ImageTrackingResult::Identifier) const;
 
             private:
                 struct Impl;

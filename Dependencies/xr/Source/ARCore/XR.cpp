@@ -183,12 +183,14 @@ namespace xr
         std::vector<Frame::InputSource> InputSources{};
         std::vector<Frame::Plane> Planes{};
         std::vector<Frame::Mesh> Meshes{};
+        std::vector<Frame::ImageTrackingResult> ImageTrackingResults{};
         std::vector<FeaturePoint> FeaturePointCloud{};
         std::optional<Frame::Space> EyeTrackerSpace{};
         float DepthNearZ{ DEFAULT_DEPTH_NEAR_Z };
         float DepthFarZ{ DEFAULT_DEPTH_FAR_Z };
         bool PlaneDetectionEnabled{ false };
         bool FeaturePointCloudEnabled{ false };
+        ArAugmentedImageDatabase* AugmentedImageDatabase;
 
         Impl(System::Impl& systemImpl, void* graphicsContext, std::function<void*()> windowProvider)
             : SystemImpl{ systemImpl }
@@ -211,7 +213,8 @@ namespace xr
                 ArPose_destroy(tempPose);
                 ArHitResult_destroy(hitResult);
                 ArHitResultList_destroy(hitResultList);
-                ArTrackableList_destroy(trackableList);
+                ArTrackableList_destroy(trackablePlanesList);
+                ArTrackableList_destroy(trackableImagesList);
                 ArFrame_destroy(xrContext->Frame);
                 xrContext->Frame = nullptr;
                 ArSession_destroy(xrContext->Session);
@@ -292,7 +295,10 @@ namespace xr
             ArHitResult_create(xrContext->Session, &hitResult);
 
             // Create the trackable list used to process planes.
-            ArTrackableList_create(xrContext->Session, &trackableList);
+            ArTrackableList_create(xrContext->Session, &trackablePlanesList);
+
+            // Create the trackable list used to process images.
+            ArTrackableList_create(xrContext->Session, &trackableImagesList);
 
             // Create the reusable ARCore ArPose used for short term operations
             // (i.e. pulling out hit test results, and updating anchors)
@@ -652,6 +658,133 @@ namespace xr
                 }
             }
         }
+        
+        std::vector<char*> CreateAugmentedImageDatabase(std::vector<System::Session::Frame::ImageTrackingBitmap> bitmaps) const
+        {
+            ArAugmentedImageDatabase_create(xrContext->Session, &AugmentedImageDatabase);
+            std::vector<char*> scores;
+
+            for (System::Session::Frame::ImageTrackingBitmap bitmap : bitmaps)
+            {
+                // Convert to grayscale. Note width also equals stride
+                uint8_t* grayscale_buffer;
+                util::ConvertRgbaToGrayscale(bitmap.data, bitmap.width, bitmap.height, bitmap.width, &grayscale_buffer);
+                // TODO : Why was this line in the ARCore sample?
+                int32_t grayscale_stride = stride / 4;
+
+                // Add each image
+                int32_t index;
+                const ArStatus status = ArAugmentedImageDatabase_addImage(
+                    xrContext->Session, AugmentedImageDatabase, "",
+                    grayscale_buffer, width, height, grayscale_stride, &index);
+                
+                // Assign a score
+                char* score;
+                if (status == AR_SUCCESS)
+                {
+                    score = System::Session::Frame::ImageTrackingScore::TRACKABLE;
+                    scores.push_back(score);
+                }
+                else if (status == AR_ERROR_IMAGE_INSUFFICIENT_QUALITY)
+                {
+                    score = System::Session::Frame::ImageTrackingScore::UNTRACKABLE;
+                    scores.push_back(score);
+                }
+                else
+                {
+                    // TODO : What's the best way to handle? - throw then catch in NativeXR as Napi::Error
+                }
+                delete[] grayscale_buffer;
+            }
+
+            return scores;
+        }
+
+        void UpdateImageTrackingResults(std::vector<Frame::ImageTrackingResult::Identifier>& updatedResults, std::vector<Frame::ImageTrackingResult::Identifier>& removedResults) const
+        {
+            // Get images
+            ArFrame_getUpdatedTrackables(xrContext->Session, xrContext->Frame, AR_TRACKABLE_AUGMENTED_IMAGE, trackableImagesList);
+            int32_t imageListSize;
+            ArTrackableList_getSize(xrContext->Session, trackableImagesList, &imageListSize);
+
+            // For each image, get properties from the trackable
+            for (int i = 0; i < imageListSize; ++i) {
+                ArTrackable* trackable = nullptr;
+                ArTrackableList_acquireItem(xrContext->Session, trackableImagesList, i, &trackable);
+                ArAugmentedImage* imageTrackable = ArAsAugmentedImage(trackable);
+
+                int imageIndex;
+                ArAugmentedImage_getIndex(xrContext->Session, imageTrackable, &imageIndex);
+
+                float measuredWidthInMeters;
+                ArAugmentedImage_getExtentX(xrContext->Session, imageTrackable, &measuredWidthInMeters);
+                
+                float rawPose[7]{};
+                ArAugmentedImage_getCenterPose(xrContext->Session, imageTrackable, tempPose);
+                ArPose_getPoseRaw(xrContext->Session, tempPose, rawPose);
+
+                ArTrackingState arTrackingState;
+                ArTrackable_getTrackingState(xrContext->Session, trackable, &arTrackingState);
+
+                // Update the existing image tracking result if it exists
+                auto resultIterator{ imageTrackingResultsMap.find(imageTrackable) };
+                if (resultIterator != imageTrackingResultsMap.end())
+                {
+                    UpdateImageTrackingResult(updatedResults, GetImageTrackingResultByID(resultIterator->second), rawPose, imageIndex, measuredWidthInMeters, arTrackingState);
+                    ArTrackable_release(reinterpret_cast<ArTrackable*>(imageTrackable));
+                }
+                else
+                {
+                    // This is a new result, create it and initialize its values.
+                    ImageTrackingResults.emplace_back();
+                    auto& result{ ImageTrackingResults.back() };
+                    imageTrackingResultsMap.insert({imageTrackable, result.ID});
+                    UpdateImageTrackingResult(updatedResults, result, rawPose, imageIndex, measuredWidthInMeters, arTrackingState);
+                }
+            }
+        }
+
+        Frame::ImageTrackingResult& GetImageTrackingResultByID(Frame::ImageTrackingResult::Identifier resultID)
+        {
+            for (Frame::ImageTrackingResult& result : ImageTrackingResults)
+            {
+                if (result.ID == resultID)
+                {
+                    return result;
+                }
+            }
+            throw std::runtime_error{"Tried to get non-existent image tracking result."};
+        }
+
+        void UpdateImageTrackingResult(
+            std::vector<Frame::ImageTrackingResult::Identifier>& updatedResults,
+            Frame::ImageTrackingResult& result,
+            const float rawPose[],
+            int imageIndex,
+            float measuredWidthInMeters,
+            ArTrackingState arTrackingState)
+        {
+            Pose newCenter{};
+            RawToPose(rawPose, newCenter);
+
+            // If the trackable wasn't updated return
+            if (!PoseWasMeaningfullyUpdated(result.ImageSpace.Pose, newCenter))
+            {
+                return;
+            }
+
+            // Update each property and push
+            result.ImageSpace.Pose = newCenter;
+            result.Index = imageIndex;
+            result.MeasuredWidthInMeters = measuredWidthInMeters;
+
+            result.TrackingState = arTrackingState == AR_TRACKING_STATE_TRACKING
+                ? Frame::ImageTrackingState::TRACKED
+                : Frame::ImageTrackingState::EMULATED;
+
+            updatedResults.push_back(result.ID);
+        }
+
 
         // Clean up all ArCore trackables owned by the current frame, this should be called once per frame.
         void CleanupFrameTrackables()
@@ -786,16 +919,16 @@ namespace xr
             CheckForSubsumedPlanes(deletedPlanes);
 
             // Next check for updated planes, and update their pose and polygon or create a new plane if it does not yet exist.
-            ArFrame_getUpdatedTrackables(xrContext->Session, xrContext->Frame, AR_TRACKABLE_PLANE, trackableList);
+            ArFrame_getUpdatedTrackables(xrContext->Session, xrContext->Frame, AR_TRACKABLE_PLANE, trackablePlanesList);
             int32_t size{};
-            ArTrackableList_getSize(xrContext->Session, trackableList, &size);
+            ArTrackableList_getSize(xrContext->Session, trackablePlanesList, &size);
             for (int i = 0; i < size; i++)
             {
                 // Get the plane.
                 ArPlane* planeTrackable{};
                 {
                     ArTrackable* trackable{};
-                    ArTrackableList_acquireItem(xrContext->Session, trackableList, i, &trackable);
+                    ArTrackableList_acquireItem(xrContext->Session, trackablePlanesList, i, &trackable);
                     planeTrackable = reinterpret_cast<ArPlane*>(trackable);
                 }
 
@@ -918,7 +1051,7 @@ namespace xr
 
             throw std::runtime_error{"Tried to get non-existent plane."};
         }
-
+        
         /**
          * Checks whether the AR camera is currently tracking.
          **/
@@ -938,6 +1071,7 @@ namespace xr
         std::vector<ArAnchor*> arCoreAnchors{};
         std::vector<float> planePolygonBuffer{};
         std::unordered_map<ArPlane*, Frame::Plane::Identifier> planeMap{};
+        std::unordered_map<ArAugmentedImage*, Frame::ImageTrackingResult::Identifier> imageTrackingResultsMap{};
         std::unordered_map<int32_t, FeaturePoint::Identifier> featurePointIDMap{};
         FeaturePoint::Identifier nextFeaturePointID{};
 
@@ -958,8 +1092,9 @@ namespace xr
         ArPose* tempPose{};
         ArHitResultList* hitResultList{};
         ArHitResult* hitResult{};
-        ArTrackableList* trackableList{};
-
+        ArTrackableList* trackablePlanesList{};
+        ArTrackableList* trackableImagesList{};
+        
         float CameraFrameUVs[VERTEX_COUNT * 2]{};
 
         AppStateChangedCallbackTicket pauseTicket;
@@ -1097,6 +1232,8 @@ namespace xr
         , RemovedPlanes{}
         , UpdatedMeshes{}
         , RemovedMeshes{}
+        , UpdatedImageTrackingResults{}
+        , RemovedImageTrackingResults{}
         , IsTracking{sessionImpl.IsTracking()}
         , m_impl{ std::make_unique<Session::Frame::Impl>(sessionImpl) }
     {
@@ -1104,12 +1241,18 @@ namespace xr
         {
             m_impl->sessionImpl.UpdatePlanes(UpdatedPlanes, RemovedPlanes);
             m_impl->sessionImpl.UpdateFeaturePointCloud();
+            m_impl->sessionImpl.UpdateImageTrackingResults(UpdatedImageTrackingResults, RemovedImageTrackingResults);
         }
     }
 
     void System::Session::Frame::GetHitTestResults(std::vector<HitResult>& filteredResults, xr::Ray offsetRay, xr::HitTestTrackableType trackableTypes) const
     {
         m_impl->sessionImpl.GetHitTestResults(filteredResults, offsetRay, trackableTypes);
+    }
+    
+    void System::Session::Frame::CreateAugmentedImageDatabase() const
+    {
+        return m_impl->sessionImpl.CreateAugmentedImageDatabase();
     }
 
     Anchor System::Session::Frame::CreateAnchor(Pose pose, NativeTrackablePtr trackable) const
@@ -1147,6 +1290,12 @@ namespace xr
         throw std::runtime_error{"Mesh detection is not supported on current platform."};
     }
 
+    System::Session::Frame::ImageTrackingResult& System::Session::Frame::GetImageTrackingResultByID(System::Session::Frame::ImageTrackingResult::Identifier imageResultID) const
+    {
+        return m_impl->sessionImpl.GetImageTrackingResultByID(imageResultID);
+    }
+
+    
     System::Session::Frame::~Frame()
     {
         m_impl->sessionImpl.CleanupFrameTrackables();
